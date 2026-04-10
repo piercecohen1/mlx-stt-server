@@ -9,3 +9,9 @@ venv/
 # Claude Code harness state (settings, plans, etc.) is machine-local.
 # Checked-in design docs live under docs/ instead.
 .claude/
+
+# CLAUDE.md is a per-machine notes file for future Claude sessions —
+# contains Spokenly config, sibling-repo paths, lessons learned, and
+# other context specific to the operator's setup. Not intended for the
+# public repo; the README carries the general instructions.
+CLAUDE.md

@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# stt-server — start/stop/status helper for the mlx-stt-server.
+#
+# Usage (both forms work):
+#   stt-server --start | --stop | --restart | --status | --logs
+#   stt-server   start |   stop |   restart |   status |   logs
+#
+# Backgrounds the server via nohup so it survives terminal close. PID is
+# tracked in $PID_FILE; stdout/stderr append to $LOG_FILE.
+#
+# Env overrides:
+#   STT_SERVER_PORT       default: 8765
+#   STT_SERVER_PYTHON     default: repo .venv/bin/python if present, else `python`
+#   STT_SERVER_MODEL      default: (server.py default, currently Cohere Transcribe)
+#   STT_SERVER_PID_FILE   default: ~/.cache/mlx-stt-server/server.pid
+#   STT_SERVER_LOG_FILE   default: ~/.cache/mlx-stt-server/server.log
+#   STT_SERVER_ENV_FILE   default: ~/.config/mlx-stt-server/env
+#
+# If the env file at $STT_SERVER_ENV_FILE exists it is sourced BEFORE the
+# variables above are resolved, so it can override any of them. This is
+# where you put non-secret toggles like MLX_STT_REQUIRE_KEY=1 for a
+# tunneled host. See README and docs/remote-access.md.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Source env file BEFORE deriving PORT/PYTHON_BIN/etc. so overrides win.
+ENV_FILE="${STT_SERVER_ENV_FILE:-$HOME/.config/mlx-stt-server/env}"
+if [[ -f "$ENV_FILE" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    set +a
+fi
+
+PORT="${STT_SERVER_PORT:-8765}"
+PID_FILE="${STT_SERVER_PID_FILE:-$HOME/.cache/mlx-stt-server/server.pid}"
+LOG_FILE="${STT_SERVER_LOG_FILE:-$HOME/.cache/mlx-stt-server/server.log}"
+
+if [[ -n "${STT_SERVER_PYTHON:-}" ]]; then
+    PYTHON_BIN="$STT_SERVER_PYTHON"
+elif [[ -x "$REPO_DIR/.venv/bin/python" ]]; then
+    PYTHON_BIN="$REPO_DIR/.venv/bin/python"
+elif [[ -x "$REPO_DIR/venv/bin/python" ]]; then
+    PYTHON_BIN="$REPO_DIR/venv/bin/python"
+else
+    PYTHON_BIN="python"
+fi
+
+EXTRA_ARGS=()
+if [[ -n "${STT_SERVER_MODEL:-}" ]]; then
+    EXTRA_ARGS+=(--model "$STT_SERVER_MODEL")
+fi
+if [[ "${MLX_STT_REQUIRE_KEY:-}" == "1" ]]; then
+    EXTRA_ARGS+=(--require-key)
+fi
+
+mkdir -p "$(dirname "$PID_FILE")" "$(dirname "$LOG_FILE")"
+
+is_running() {
+    [[ -f "$PID_FILE" ]] || return 1
+    local pid
+    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    [[ -n "$pid" ]] || return 1
+    kill -0 "$pid" 2>/dev/null
+}
+
+cmd_start() {
+    if is_running; then
+        echo "stt-server: already running (pid $(cat "$PID_FILE")) on :$PORT"
+        return 0
+    fi
+    echo "stt-server: starting on :$PORT"
+    echo "stt-server:   python: $PYTHON_BIN"
+    echo "stt-server:   log:    $LOG_FILE"
+    cd "$REPO_DIR"
+    nohup "$PYTHON_BIN" server.py --port "$PORT" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} >> "$LOG_FILE" 2>&1 &
+    local pid=$!
+    disown "$pid" 2>/dev/null || true
+    echo "$pid" > "$PID_FILE"
+    echo "stt-server: started pid $pid (preloading model; run --status in ~5s)"
+}
+
+cmd_stop() {
+    if ! is_running; then
+        echo "stt-server: not running"
+        rm -f "$PID_FILE"
+        return 0
+    fi
+    local pid
+    pid="$(cat "$PID_FILE")"
+    echo "stt-server: stopping pid $pid"
+    kill "$pid" 2>/dev/null || true
+    for _ in $(seq 1 40); do
+        if ! kill -0 "$pid" 2>/dev/null; then break; fi
+        sleep 0.25
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "stt-server: graceful shutdown timed out, sending SIGKILL"
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$PID_FILE"
+    echo "stt-server: stopped"
+}
+
+cmd_status() {
+    if is_running; then
+        local pid
+        pid="$(cat "$PID_FILE")"
+        echo "stt-server: running pid $pid on :$PORT"
+        if curl -sf "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then
+            echo "stt-server: health OK"
+        elif curl -sf "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1; then
+            # Backward compat with pre-remote-access server.py which had
+            # no /healthz. Remove once docs/remote-access.md is executed.
+            echo "stt-server: health OK (legacy /v1/models probe)"
+        else
+            echo "stt-server: health FAIL (model may still be loading — retry in a few seconds)"
+            return 1
+        fi
+    else
+        echo "stt-server: not running"
+        return 1
+    fi
+}
+
+cmd_restart() {
+    cmd_stop
+    cmd_start
+}
+
+cmd_logs() {
+    if [[ ! -f "$LOG_FILE" ]]; then
+        echo "stt-server: no log at $LOG_FILE"
+        return 1
+    fi
+    tail -f "$LOG_FILE"
+}
+
+usage() {
+    cat >&2 <<EOF
+usage: stt-server {--start|--stop|--restart|--status|--logs}
+
+Start/stop/inspect the mlx-stt-server. Flag form (--start) and bare form
+(start) are both accepted.
+
+See README.md for installation and docs/remote-access.md for the remote
+access / Cloudflare tunnel design.
+EOF
+    exit 2
+}
+
+case "${1:-}" in
+    --start|start)     cmd_start ;;
+    --stop|stop)       cmd_stop ;;
+    --status|status)   cmd_status ;;
+    --restart|restart) cmd_restart ;;
+    --logs|logs)       cmd_logs ;;
+    -h|--help|help)    usage ;;
+    *)                 usage ;;
+esac

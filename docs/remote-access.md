@@ -2,31 +2,38 @@
 
 ## Context
 
-`server.py` currently has no authentication — the "API key" field in Spokenly
-is cosmetic, and the server only binds to `127.0.0.1`, which is fine for
-localhost dictation but a non-starter the moment it's reachable from the
-internet. Pierce wants to run the server on his Mac Mini and hit it from his
-MBP (and phone) via a Cloudflare Tunnel so he has one always-on dictation
-endpoint instead of duplicating the setup per machine.
+`server.py` currently has no authentication — the "API key" field in any
+OpenAI-compatible client is cosmetic, and the server only binds to
+`127.0.0.1`, which is fine for localhost dictation but a non-starter the
+moment it's reachable from the internet. This plan adds bearer-token auth
+and the hardening needed to safely expose the server through a Cloudflare
+Tunnel, so you can run it on one always-on host (e.g. a Mac Mini) and hit
+it from your laptop and phone without duplicating the setup per machine.
 
-Goal: a remote-reachable endpoint that is (a) not publicly open, (b) requires
-a strong secret to transcribe, (c) leaves the local-only flow unchanged when
-no key is configured, and (d) involves zero router/firewall configuration on
-the Mini.
+Goal: a remote-reachable endpoint that is (a) not publicly open, (b)
+requires a strong secret to transcribe, (c) leaves the local-only flow
+unchanged when no key is configured, and (d) involves zero router /
+firewall configuration on the host.
 
-**Non-goals:** per-user auth, Cloudflare Access SSO (Spokenly only sends one
-header), rate limiting (deferred), live key rotation (restart is fine), and
-always-on via launchd on the Mini (`scripts/cohere` is sufficient).
+**Non-goals:** per-user auth, Cloudflare Access SSO (most dictation clients
+only send one credential header, so Access service tokens which need two
+custom headers would lock them out), rate limiting (deferred), live key
+rotation (restart is fine), and always-on via launchd on the host
+(`scripts/stt-server` is sufficient).
 
-This plan was iterated once with Codex after an initial draft. Codex caught
-two blockers (host-based footgun guard is wrong for the tunnel scenario;
-FastAPI's auto `/docs`, `/openapi.json`, `/redoc` and the disclosive `/` were
-not covered) and six should-fixes — all folded in below.
+This plan went through seven rounds of Codex review (`-s read-only`,
+severity-tagged CRITICAL/HIGH/MEDIUM/LOW). The substantive design
+decisions — file-based key loading with `os.open(O_NOFOLLOW)` + fstat +
+uid/mode check, auth as an ASGI middleware that runs before Starlette's
+form parser, a pre-parse Content-Length body-size cap, FastAPI
+`/docs`/`/redoc`/`/openapi.json` disablement, symlink-safe atomic writes
+for the key file — all came out of those iterations. Don't "simplify"
+them back without understanding why they're that shape.
 
 ## Architecture
 
 ```
-Spokenly (MBP/phone)
+Client (laptop/phone)
         │   https://cohere.<domain>
         │   Authorization: Bearer <token>
         ▼
@@ -34,7 +41,7 @@ Cloudflare edge ── TLS terminates, DDoS, edge logs ──
         │
         │   encrypted QUIC to origin connector
         ▼
-cloudflared (Mac Mini, runs as launchd service)
+cloudflared (tunneled host, runs as launchd service)
         │
         │   http://127.0.0.1:8765     (loopback only)
         ▼
@@ -43,18 +50,18 @@ server.py  ── validates Authorization: Bearer (constant-time) ──
 
 **Why bearer token in the origin, not Cloudflare Access:** Access service
 tokens require two custom headers (`CF-Access-Client-Id` + `CF-Access-Client-
-Secret`). Spokenly's OpenAI-compatible config only exposes one credential
+Secret`). Most dictation clients' OpenAI-compatible config only exposes one credential
 slot, mapped to `Authorization`, so Access would lock out the primary
 client. Tunnel alone still gives us: no open ports, TLS at edge, origin on
 loopback, automatic HTTPS cert.
 
 **Layers of defense:**
-1. No inbound ports on the Mini (cloudflared makes an outbound connection)
-2. Server binds `127.0.0.1` only → even on the Mini's LAN, nothing but
+1. No inbound ports on the host (cloudflared makes an outbound connection)
+2. Server binds `127.0.0.1` only → even on the host's LAN, nothing but
    cloudflared on the same host can reach it
 3. Server rejects any request without a valid `Authorization: Bearer`
-   when a key file is present → even if someone got on the Mini, they
-   still need the contents of `~/.config/cohere-stt/api-key`
+   when a key file is present → even if someone got on the host, they
+   still need the contents of `~/.config/mlx-stt-server/api-key`
 4. Footgun guard: `--require-key` refuses to start with a blank/unset key,
    independent of bind address. The deployment always sets it.
 
@@ -78,7 +85,7 @@ app = FastAPI(
 )
 ```
 
-**Remove `CORSMiddleware` entirely.** Spokenly is not a browser; dropping
+**Remove `CORSMiddleware` entirely.** Dictation clients are not browsers; dropping
 CORS eliminates the "phishing page in the user's browser tries to use the
 tunnel endpoint" class of attack. If we ever need browser access, re-add
 with an explicit origin list and a reason comment.
@@ -95,7 +102,7 @@ The load path is **TOCTOU-safe**: we `os.open()` once with `O_NOFOLLOW`
 owner, then read from the same fd. No second `open()` on the pathname.
 
 ```python
-DEFAULT_KEY_FILE = os.path.expanduser("~/.config/cohere-stt/api-key")
+DEFAULT_KEY_FILE = os.path.expanduser("~/.config/mlx-stt-server/api-key")
 
 def _load_api_key() -> Optional[str]:
     path = os.environ.get("MLX_STT_API_KEY_FILE") or DEFAULT_KEY_FILE
@@ -261,7 +268,7 @@ async def create_transcription(...): ...
 async def create_translation(...): ...
 ```
 `/healthz` stays unauth via the `UNAUTH_PATHS` allowlist so
-`cohere-status` and cloudflared can probe it without the key. It
+`stt-server --status` and cloudflared can probe it without the key. It
 returns nothing but `ok` — no service name, no loaded models, no
 endpoint list.
 
@@ -308,13 +315,14 @@ app.add_middleware(MaxBodySizeMiddleware, max_bytes=MAX_UPLOAD_BYTES)
 ```
 
 This catches any client that honestly declares `Content-Length` (curl,
-requests, Spokenly, the OpenAI SDK — all do). Chunked transfer without
-`Content-Length` is a theoretical bypass but out of scope for a
-single-user dictation endpoint; Cloudflare's edge enforces its own 100 MB
-upload limit on the free tier anyway, which is the outer guardrail.
+requests, the OpenAI SDK, every dictation client I'm aware of — all
+do). Chunked transfer without `Content-Length` is a theoretical bypass
+but out of scope for a single-user dictation endpoint; Cloudflare's
+edge enforces its own 100 MB upload limit on the free tier anyway,
+which is the outer guardrail.
 
-Default cap is 100 MB (well above any dictation snippet —
-`pierce-voice-note.m4a` is ~0.6 MB). Override with `MLX_STT_MAX_UPLOAD_MB`.
+Default cap is 100 MB (well above any dictation snippet — the shipped
+`samples/test.m4a` is ~28 KB). Override with `MLX_STT_MAX_UPLOAD_MB`.
 The in-handler `await file.read()` path is otherwise unchanged; no more
 cosmetic byte counting inside the route.
 
@@ -337,24 +345,24 @@ except Exception as e:
 so the lifespan check reads it at startup. This is also why the guard
 lives in lifespan, not main(): `uvicorn server:app` direct invocation
 still honors `MLX_STT_REQUIRE_KEY=1` set in the environment (e.g. via the
-`~/.config/cohere-stt/env` file sourced by `scripts/cohere`).
+`~/.config/mlx-stt-server/env` file sourced by `scripts/stt-server`).
 
-### 2. `scripts/cohere` — source env file FIRST, switch health probe
+### 2. `scripts/stt-server` — source env file FIRST, switch health probe
 
 Move env-file sourcing to the very top, right after `set -euo pipefail` and
 the `SCRIPT_DIR`/`REPO_DIR` derivation, so any var in the file — including
-`COHERE_STT_PORT`, `COHERE_STT_PYTHON`, `MLX_STT_API_KEY_FILE` (path only,
+`STT_SERVER_PORT`, `STT_SERVER_PYTHON`, `MLX_STT_API_KEY_FILE` (path only,
 not secret), `MLX_STT_REQUIRE_KEY` — can override the subsequent defaults.
 **The actual bearer token never enters the shell environment**; it stays in
 the 0600 file pointed to by `MLX_STT_API_KEY_FILE` (default
-`~/.config/cohere-stt/api-key`) and is read directly by `server.py`:
+`~/.config/mlx-stt-server/api-key`) and is read directly by `server.py`:
 
 ```bash
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 
 # Source env file BEFORE deriving PORT/PYTHON_BIN/etc. so overrides win.
-ENV_FILE="${COHERE_STT_ENV_FILE:-$HOME/.config/cohere-stt/env}"
+ENV_FILE="${STT_SERVER_ENV_FILE:-$HOME/.config/mlx-stt-server/env}"
 if [[ -f "$ENV_FILE" ]]; then
     set -a
     # shellcheck disable=SC1090
@@ -362,7 +370,7 @@ if [[ -f "$ENV_FILE" ]]; then
     set +a
 fi
 
-PORT="${COHERE_STT_PORT:-8765}"
+PORT="${STT_SERVER_PORT:-8765}"
 # ... rest of existing derivations
 ```
 
@@ -379,9 +387,9 @@ Change `cmd_status`'s curl probe from `/v1/models` (now protected) to the
 new unauth endpoint:
 ```bash
 if curl -sf "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then
-    echo "cohere-stt: health OK"
+    echo "mlx-stt-server: health OK"
 else
-    echo "cohere-stt: health FAIL (model may still be loading — retry in a few seconds)"
+    echo "mlx-stt-server: health FAIL (model may still be loading — retry in a few seconds)"
     return 1
 fi
 ```
@@ -390,16 +398,16 @@ fi
 
 ```bash
 # ── Non-secrets only. The actual bearer token lives in a 0600 file at
-# ── the path below (default ~/.config/cohere-stt/api-key), NOT in this
+# ── the path below (default ~/.config/mlx-stt-server/api-key), NOT in this
 # ── sourced env file, because sourcing would put the secret in the
 # ── process environment of every child.
 
 # Override the default key-file path if you want. Leave commented to use
-# ~/.config/cohere-stt/api-key.
+# ~/.config/mlx-stt-server/api-key.
 # MLX_STT_API_KEY_FILE=
 
 # Set to 1 to refuse startup when no key file is found or it's empty.
-# ALWAYS set this on the Mac Mini (the tunneled host). It's the footgun
+# ALWAYS set this on the tunneled host. It's the footgun
 # guard against accidentally booting an unauth server that the tunnel
 # would cheerfully expose. Read by the FastAPI lifespan handler, so it
 # applies to both `python server.py --require-key` and direct
@@ -407,15 +415,15 @@ fi
 MLX_STT_REQUIRE_KEY=1
 
 # Optional overrides (all have sensible defaults):
-# COHERE_STT_PORT=8765
-# COHERE_STT_MODEL=CohereLabs/cohere-transcribe-03-2026
-# COHERE_STT_PYTHON=
+# STT_SERVER_PORT=8765
+# STT_SERVER_MODEL=CohereLabs/cohere-transcribe-03-2026
+# STT_SERVER_PYTHON=
 # MLX_STT_MAX_UPLOAD_MB=100
 ```
 
 Because this file holds no secrets, it can be `chmod 644` and, if the
 user wants, checked into a private dotfiles repo. The actual key file at
-`~/.config/cohere-stt/api-key` must always be `chmod 600` — the server
+`~/.config/mlx-stt-server/api-key` must always be `chmod 600` — the server
 refuses to start otherwise.
 
 ### 4. `README.md` — new "Remote access via Cloudflare Tunnel" section
@@ -423,46 +431,60 @@ refuses to start otherwise.
 Add after the existing "Background via shell aliases" section:
 - API key setup: a symlink-safe same-directory `mktemp` → `chmod 600`
   → atomic `mv -f` that writes the bearer token to
-  `~/.config/cohere-stt/api-key`, plus `MLX_STT_REQUIRE_KEY=1` in
-  `~/.config/cohere-stt/env` (chmod 644, no secret in here). The
+  `~/.config/mlx-stt-server/api-key`, plus `MLX_STT_REQUIRE_KEY=1` in
+  `~/.config/mlx-stt-server/env` (chmod 644, no secret in here). The
   exact one-liner lives in the runbook below; the README just
   references the runbook rather than duplicating the command (so a
   copy-paste from the README can never regress the atomic pattern).
 - Cloudflared runbook (see "Runbook" below)
-- Spokenly config update: Base URL `https://cohere.<domain>`, API Key = token
+- Client config update: whatever OpenAI-compatible client you use,
+  set Base URL to `https://<your-hostname>` and paste the bearer token
+  as the API key.
 
-### 5. `CLAUDE.md` — document the auth model
+### 5. `README.md` — document the auth model (public)
 
-Add a "Remote access" section:
-- **Two files**, split by secret/non-secret:
-  - `~/.config/cohere-stt/api-key` — the raw bearer token, chmod **600**.
-    Read directly by `server.py` at startup; never sourced, never
-    exported, never touched by the wrapper script.
-  - `~/.config/cohere-stt/env` — non-secret toggles only (chmod 644);
-    sourced by `scripts/cohere` at the top of the script.
-- The `MLX_STT_REQUIRE_KEY=1` convention for tunneled hosts (set in the
-  env file).
-- Key rotation: use the same symlink-safe mktemp+mv pattern as the
-  initial creation — write a fresh `openssl rand -hex 32` into a new
-  `mktemp ~/.config/cohere-stt/.api-key.XXXXXX`, `chmod 600`, then
-  `mv -f` into place. Never redirect directly to the final path
-  (`> ~/.config/cohere-stt/api-key`) even during rotation; a symlink
-  swap between rotations would exfiltrate the new key. Then
-  `cohere-restart` to pick up the new key.
-- Why file-based, not env-var: an env-var token lands in the wrapper
-  and server process environment where it's visible to `ps -ewww`,
-  same-uid `/proc`-style inspection, and macOS diagnostic captures
-  (`sysdiagnose`, crash reports). A 0600 file read directly by the
-  server bypasses all of those exposure paths. This was a deliberate
-  hardening call made in plan v4.
-- Cloudflare tunnel config on the Mini (`~/.cloudflared/config.yml`)
+Append a "Remote access" subsection under the existing "Run" section
+pointing at this plan doc. Keep the README version short — one
+paragraph + a link here. All the security detail lives in this file.
 
-## Runbook (Pierce runs these on the Mac Mini)
+(This repo does not ship a `CLAUDE.md` — it's in `.gitignore` because
+per-operator context varies. If you keep a local `CLAUDE.md` for your
+own notes, that's fine, it just won't be pushed.)
 
-1. `brew install cloudflared` (already installed on MBP; confirm on Mini)
+## Prerequisites
+
+Before running the runbook, confirm on the host machine (the one that
+will run the server and the tunnel):
+
+1. **Python + venv**:
+   ```bash
+   cd /path/to/mlx-stt-server
+   python3 -m venv .venv
+   source .venv/bin/activate
+   pip install -r requirements.txt
+   ```
+2. **Hugging Face token** (only needed if you want the default gated
+   Cohere model). Either `huggingface-cli login` or `export HF_TOKEN=...`.
+   Without this the first model load will 401.
+3. **cloudflared**: `brew install cloudflared`
+4. **A domain already on Cloudflare.** The runbook assumes you have a
+   zone in your Cloudflare account that you want to use for the tunnel
+   hostname. `cloudflared tunnel login` will show you a picker for your
+   zones.
+5. **Hostname decision**: pick the subdomain you want the tunnel to
+   respond at — e.g. `stt.example.com`, `dictation.example.com`,
+   `mlx.example.com`. You'll need this at runbook step 5.
+6. **Audio sample for the verification step**: the shipped
+   `samples/test.m4a` (generated by macOS `say`) is used by the local
+   auth matrix. If you remove it, edit the `$AUDIO` variable in the
+   verification script to point at your own clip.
+
+## Runbook (run these on the host machine)
+
+1. `brew install cloudflared` (if not done in prerequisites above)
 2. Generate the key FILE and the non-secret env file via a
    **symlink-safe atomic write** — never redirect into the final path
-   directly. A hostile symlink already at `~/.config/cohere-stt/api-key`
+   directly. A hostile symlink already at `~/.config/mlx-stt-server/api-key`
    would otherwise receive the token before any `chmod` could take
    effect. The pattern is: create a 0600 tmpfile in the same directory
    with `mktemp`, write into it, then `mv -f` atomically into place
@@ -470,57 +492,58 @@ Add a "Remote access" section:
    source and destination are regular files in the same filesystem,
    and atomically replaces any existing file at the destination).
    ```bash
-   mkdir -p ~/.config/cohere-stt
+   mkdir -p ~/.config/mlx-stt-server
 
    # --- The bearer token (0600, symlink-safe atomic write) ---
-   TMPKEY=$(mktemp "$HOME/.config/cohere-stt/.api-key.XXXXXX")
+   TMPKEY=$(mktemp "$HOME/.config/mlx-stt-server/.api-key.XXXXXX")
    chmod 600 "$TMPKEY"
    openssl rand -hex 32 > "$TMPKEY"
-   mv -f "$TMPKEY" ~/.config/cohere-stt/api-key
+   mv -f "$TMPKEY" ~/.config/mlx-stt-server/api-key
 
    # --- Non-secret toggles (no key in here) ---
    # Env file has no secret, so a plain redirect is fine. Still use
    # mktemp+mv for consistency and so that re-running the step
    # doesn't momentarily expose an empty file during write.
-   TMPENV=$(mktemp "$HOME/.config/cohere-stt/.env.XXXXXX")
+   TMPENV=$(mktemp "$HOME/.config/mlx-stt-server/.env.XXXXXX")
    printf 'MLX_STT_REQUIRE_KEY=1\n' > "$TMPENV"
    chmod 644 "$TMPENV"
-   mv -f "$TMPENV" ~/.config/cohere-stt/env
+   mv -f "$TMPENV" ~/.config/mlx-stt-server/env
    ```
-   After this, `scripts/cohere start` sources the env file → sets
+   After this, `scripts/stt-server start` sources the env file → sets
    `MLX_STT_REQUIRE_KEY=1` → `server.py`'s lifespan reads the token
-   directly from `~/.config/cohere-stt/api-key` at startup. The token
+   directly from `~/.config/mlx-stt-server/api-key` at startup. The token
    is never present in any shell or process environment variable.
 3. `cloudflared tunnel login` → pick the Cloudflare zone
-4. `cloudflared tunnel create cohere-stt` → writes
+4. `cloudflared tunnel create mlx-stt-server` → writes
    `~/.cloudflared/<uuid>.json`
 5. Create `~/.cloudflared/config.yml`:
    ```yaml
    tunnel: <uuid>
-   credentials-file: /Users/piercecohen/.cloudflared/<uuid>.json
+   credentials-file: /Users/YOUR_USER/.cloudflared/<uuid>.json
    ingress:
-     - hostname: cohere.<domain>
+     - hostname: <your-hostname>
        service: http://127.0.0.1:8765
      - service: http_status:404
    ```
-6. `cloudflared tunnel route dns cohere-stt cohere.<domain>`
+6. `cloudflared tunnel route dns mlx-stt-server <your-hostname>`
 7. `sudo cloudflared service install` → launchd agent starts tunnel at boot
-8. `cohere-start` on the Mini — picks up the env file, loads the key,
-   refuses to start if the key is missing
-9. **(From the MBP now, not the Mini.)** Fetch the token to a local 0600
+8. `stt-server --start` on the host — picks up the env file, loads the
+   key, refuses to start if the key is missing
+9. **(From any client machine now, not the tunneled host.)** Fetch the
+   token to a local 0600
    file via a symlink-safe atomic write, then hit the tunnel with
    curl -K so the token never lands on any argv:
    ```bash
-   mkdir -p ~/.config/cohere-stt
+   mkdir -p ~/.config/mlx-stt-server
    # Create the destination 0600 in the same directory BEFORE writing,
    # using mktemp + atomic mv. This defeats symlink-swap attacks on the
-   # final path: a hostile symlink at ~/.config/cohere-stt/api-key
+   # final path: a hostile symlink at ~/.config/mlx-stt-server/api-key
    # cannot redirect the write, because we write to a fresh tmpfile and
    # the rename operation does not follow symlinks on the destination.
-   TMPKEY=$(mktemp "$HOME/.config/cohere-stt/.api-key.XXXXXX")
+   TMPKEY=$(mktemp "$HOME/.config/mlx-stt-server/.api-key.XXXXXX")
    chmod 600 "$TMPKEY"
-   ssh mac-mini 'cat ~/.config/cohere-stt/api-key' > "$TMPKEY"
-   mv -f "$TMPKEY" "$HOME/.config/cohere-stt/api-key"
+   ssh <tunneled-host> 'cat ~/.config/mlx-stt-server/api-key' > "$TMPKEY"
+   mv -f "$TMPKEY" "$HOME/.config/mlx-stt-server/api-key"
 
    # Use curl -K with a temp 0600 config file. The $(cat ...) expansion
    # happens in the shell process; it never becomes an argv to any
@@ -528,18 +551,21 @@ Add a "Remote access" section:
    # after the request.
    CURL_CONF=$(mktemp); chmod 600 "$CURL_CONF"
    printf 'header = "Authorization: Bearer %s"\n' \
-       "$(cat ~/.config/cohere-stt/api-key)" > "$CURL_CONF"
-   curl -fsS -K "$CURL_CONF" https://cohere.<domain>/v1/models
+       "$(cat ~/.config/mlx-stt-server/api-key)" > "$CURL_CONF"
+   curl -fsS -K "$CURL_CONF" https://<your-hostname>/v1/models
    : > "$CURL_CONF"   # scrub
    rm -f "$CURL_CONF"
    ```
-   The key file on the MBP (`~/.config/cohere-stt/api-key`) exists so
-   that Spokenly can be configured manually (step 10), and so that
-   subsequent test curls can use the same pattern without re-fetching.
-10. **(Still on the MBP/phone.)** Spokenly: Base URL `https://cohere.<domain>`,
-    paste the API Key field by `cat`-ing the local key file in a
-    terminal and copy-pasting the contents. (Spokenly stores it in its
-    own Keychain entry, not a shell history.)
+   The key file on the client (`~/.config/mlx-stt-server/api-key`)
+   exists so that your dictation client can be configured manually
+   (step 10) and so subsequent test curls can reuse the same pattern
+   without re-fetching.
+10. **(Still on the client machine.)** Configure your OpenAI-compatible
+    client: Base URL `https://<your-hostname>` (or `.../v1` for SDK
+    clients that don't append it), and paste the API Key field by
+    `cat`-ing the local key file in a terminal and copy-pasting the
+    contents. Most dictation clients store the key in their own
+    Keychain entry, not in shell history, so paste-and-forget is safe.
 
 ## Critical files
 
@@ -579,7 +605,7 @@ Add a "Remote access" section:
   - `main()` at bottom → `--require-key` flag that sets
     `os.environ["MLX_STT_REQUIRE_KEY"] = "1"` *before* `uvicorn.run()`.
     No `--api-key` CLI flag exists — the key is always file-based.
-- `scripts/cohere` — env sourcing at the very top (before `PORT=`, line ~22),
+- `scripts/stt-server` — env sourcing at the very top (before `PORT=`, line ~22),
   `--require-key` appending in EXTRA_ARGS (line ~36), health probe change in
   `cmd_status` (line ~94)
 - New: `.env.example` at repo root
@@ -587,19 +613,34 @@ Add a "Remote access" section:
 
 ## Verification
 
-### Local auth matrix (MBP, before deploying)
+### Local auth matrix (run from the repo root before deploying)
 
-Save as a bash script and run. Every `assert_code` / `assert_exit` must pass
-or the script aborts. Aliases are not available in a non-interactive shell,
-so we call `scripts/cohere` directly.
+Save as `scripts/verify-auth.sh` (or any path inside the repo) and run.
+Every `assert_code` / `assert_exit` must pass or the script aborts.
+Aliases are not available in a non-interactive shell, so we call
+`./scripts/stt-server` directly. The script is self-locating — it
+resolves the repo root from its own location, so `REPO` is correct no
+matter where you clone the repo or what CWD you run it from.
 
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO=/Users/piercecohen/mlx/mlx-cohere-openai-compatible-api
+# Self-locate: resolve REPO to the repo root regardless of where this
+# script lives inside the repo or what CWD it was invoked from.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO"
-AUDIO=/Users/piercecohen/mlx/mlx-audio-tests/pierce-voice-note.m4a
+
+# Use the shipped sample unless overridden. samples/test.m4a is a small
+# macOS `say` synthesized clip committed to the repo so the verification
+# works anywhere without relying on a user's personal audio.
+AUDIO="${AUDIO:-$REPO/samples/test.m4a}"
+if [[ ! -f "$AUDIO" ]]; then
+    echo "error: sample audio missing at $AUDIO" >&2
+    echo "set AUDIO=/path/to/clip.m4a or regenerate samples/test.m4a" >&2
+    exit 1
+fi
 
 # --- Token hygiene helpers --------------------------------------------------
 # All auth-bearing curl calls go through mk_auth_conf + curl -K so the token
@@ -663,11 +704,11 @@ cleanup() {
     if [[ -n "$BIGWAV" && -f "$BIGWAV" ]]; then
         rm -f "$BIGWAV"
     fi
-    ./scripts/cohere stop 2>/dev/null || true
+    ./scripts/stt-server stop 2>/dev/null || true
 }
 trap cleanup EXIT
 
-./scripts/cohere stop || true
+./scripts/stt-server stop || true
 unset MLX_STT_API_KEY_FILE MLX_STT_REQUIRE_KEY
 
 # ---------------------------------------------------------------------------
@@ -675,7 +716,7 @@ unset MLX_STT_API_KEY_FILE MLX_STT_REQUIRE_KEY
 # ---------------------------------------------------------------------------
 # Point the server at a non-existent key file path so it falls through to
 # "local mode, no auth" regardless of what's in the default location.
-MLX_STT_API_KEY_FILE=/nonexistent/cohere-stt-key \
+MLX_STT_API_KEY_FILE=/nonexistent/mlx-stt-server-key \
     python server.py --no-preload &
 SRV=$!
 sleep 1
@@ -694,7 +735,7 @@ SRV=""
 # ---------------------------------------------------------------------------
 # 2. --require-key with no key file → non-zero exit
 # ---------------------------------------------------------------------------
-MLX_STT_API_KEY_FILE=/nonexistent/cohere-stt-key \
+MLX_STT_API_KEY_FILE=/nonexistent/mlx-stt-server-key \
     assert_exit_nonzero python server.py --require-key --no-preload
 
 # ---------------------------------------------------------------------------
@@ -725,14 +766,14 @@ rm -f "$BAD_MODE_FILE"
 #     guard would pass step 2 but fail one of these.
 # ---------------------------------------------------------------------------
 # env-var-only (no --require-key CLI flag) → must refuse
-MLX_STT_API_KEY_FILE=/nonexistent/cohere-stt-key MLX_STT_REQUIRE_KEY=1 \
+MLX_STT_API_KEY_FILE=/nonexistent/mlx-stt-server-key MLX_STT_REQUIRE_KEY=1 \
     assert_exit_nonzero python server.py --no-preload
 
 # uvicorn server:app direct boot → must refuse
 # (Use a distinct port so we don't collide with any server from earlier
 # steps. uvicorn reads MLX_STT_REQUIRE_KEY from env at lifespan startup,
 # raises RuntimeError, uvicorn exits non-zero.)
-MLX_STT_API_KEY_FILE=/nonexistent/cohere-stt-key MLX_STT_REQUIRE_KEY=1 \
+MLX_STT_API_KEY_FILE=/nonexistent/mlx-stt-server-key MLX_STT_REQUIRE_KEY=1 \
     assert_exit_nonzero uvicorn server:app \
         --host 127.0.0.1 --port 8767 --log-level critical
 
@@ -791,63 +832,65 @@ kill "$SRV"; wait "$SRV" 2>/dev/null || true
 SRV=""
 
 # ---------------------------------------------------------------------------
-# 7. scripts/cohere: prove the env-file-first-source fix works AND that
+# 7. scripts/stt-server: prove the env-file-first-source fix works AND that
 #    the wrapper picks up MLX_STT_API_KEY_FILE from the env file, not the
-#    user's shell environment. Use a non-default COHERE_STT_PORT to prove
+#    user's shell environment. Use a non-default STT_SERVER_PORT to prove
 #    env-file values actually override the wrapper defaults.
 # ---------------------------------------------------------------------------
-unset MLX_STT_API_KEY_FILE MLX_STT_REQUIRE_KEY COHERE_STT_PORT
+unset MLX_STT_API_KEY_FILE MLX_STT_REQUIRE_KEY STT_SERVER_PORT
 
 TEST_ENV_FILE=$(mktemp -t cohere-test-env.XXXXXX)
 chmod 644 "$TEST_ENV_FILE"  # no secret in here
-printf 'MLX_STT_API_KEY_FILE=%s\nMLX_STT_REQUIRE_KEY=1\nCOHERE_STT_PORT=8766\n' \
+printf 'MLX_STT_API_KEY_FILE=%s\nMLX_STT_REQUIRE_KEY=1\nSTT_SERVER_PORT=8766\n' \
     "$TEST_KEY_FILE" > "$TEST_ENV_FILE"
 
-COHERE_STT_ENV_FILE="$TEST_ENV_FILE" ./scripts/cohere start
+STT_SERVER_ENV_FILE="$TEST_ENV_FILE" ./scripts/stt-server start
 sleep 5
-COHERE_STT_ENV_FILE="$TEST_ENV_FILE" ./scripts/cohere status
+STT_SERVER_ENV_FILE="$TEST_ENV_FILE" ./scripts/stt-server status
 
 # Prove the port override took effect — server is on 8766, not 8765
 assert_code 200 http://127.0.0.1:8766/healthz
 assert_code 401 http://127.0.0.1:8766/v1/models
 assert_code 200 http://127.0.0.1:8766/v1/models -K "$AUTH_CONF"
 
-COHERE_STT_ENV_FILE="$TEST_ENV_FILE" ./scripts/cohere stop
+STT_SERVER_ENV_FILE="$TEST_ENV_FILE" ./scripts/stt-server stop
 
 echo "All checks passed."
 ```
 
-### End-to-end via the tunnel (run on the Mini + MBP)
+### End-to-end via the tunnel (run on the tunneled host + a client)
 
 Same token hygiene as the local verification — no shell variables, no
 curl argv containing the bearer.
 
 ```bash
-# --- On the Mini ----------------------------------------------------------
-cohere-start
-cohere-status   # health OK via /healthz
+# --- On the tunneled host ------------------------------------------------
+stt-server --start
+stt-server --status   # health OK via /healthz
 # launchd-managed cloudflared should already be up; confirm:
-cloudflared tunnel info cohere-stt
+cloudflared tunnel info mlx-stt-server
 
-# --- On the MBP -----------------------------------------------------------
-# Assumes ~/.config/cohere-stt/api-key was already populated via the
+# --- On a client machine -------------------------------------------------
+# Assumes ~/.config/mlx-stt-server/api-key was already populated via the
 # atomic mktemp+mv pattern in runbook step 9. If not, run that first.
 
 AUTH_CONF=$(mktemp); chmod 600 "$AUTH_CONF"
 printf 'header = "Authorization: Bearer %s"\n' \
-    "$(cat ~/.config/cohere-stt/api-key)" > "$AUTH_CONF"
+    "$(cat ~/.config/mlx-stt-server/api-key)" > "$AUTH_CONF"
 trap '{ : > "$AUTH_CONF"; rm -f "$AUTH_CONF"; }' EXIT
 
-curl -fsS -K "$AUTH_CONF" https://cohere.<domain>/v1/models
+curl -fsS -K "$AUTH_CONF" https://<your-hostname>/v1/models
 
+# Use the shipped sample clip (or your own) — it's portable across
+# machines because it lives in the repo.
 curl -fsS -K "$AUTH_CONF" -X POST \
-    https://cohere.<domain>/v1/audio/transcriptions \
-    -F "file=@/Users/piercecohen/mlx/mlx-audio-tests/pierce-voice-note.m4a"
+    https://<your-hostname>/v1/audio/transcriptions \
+    -F "file=@samples/test.m4a"
 
-# Spokenly setup: open a terminal, `cat ~/.config/cohere-stt/api-key`,
-# copy-paste the output into the API Key field, set Base URL =
-# https://cohere.<domain>. Spokenly stores it in its own Keychain
-# entry — not in any shell history.
+# Client setup: open a terminal, `cat ~/.config/mlx-stt-server/api-key`,
+# copy-paste the output into the API Key field of your dictation client,
+# set Base URL = https://<your-hostname>. Most clients store the key in
+# their own Keychain entry — not in any shell history.
 ```
 
 ### Codex review of the implementation (final gate before committing)
@@ -857,9 +900,9 @@ audit the actual code — not the plan this time — for the same class of
 issues Codex flagged in this plan.
 
 ```bash
-cat /tmp/codex-cohere-impl-prompt.txt | codex -a never exec -s read-only \
-  -C /Users/piercecohen/mlx/mlx-cohere-openai-compatible-api \
-  -o /tmp/codex-cohere-impl-out.md
+cat /tmp/codex-mlx-stt-impl-prompt.txt | codex -a never exec -s read-only \
+  -C "$(git rev-parse --show-toplevel)" \
+  -o /tmp/codex-mlx-stt-impl-out.md
 ```
 
 Prompt asks Codex to do an **open-ended, security-focused** review of
@@ -909,14 +952,14 @@ Codex to only these):
   middleware before the route handler runs.
 - **Lifespan guards hold across all entrypoints**: `python server.py
   --require-key`, direct `uvicorn server:app` with
-  `MLX_STT_REQUIRE_KEY=1`, and `./scripts/cohere start` with an env
+  `MLX_STT_REQUIRE_KEY=1`, and `./scripts/stt-server start` with an env
   file that sets `MLX_STT_REQUIRE_KEY=1`. Test each.
-- **Env-file sourcing in `scripts/cohere`** happens BEFORE `PORT=`,
+- **Env-file sourcing in `scripts/stt-server`** happens BEFORE `PORT=`,
   `PYTHON_BIN=`, `EXTRA_ARGS` derivation. No key ends up in
   `server.log`, `server.pid`, or the shell history. The env file
   itself contains NO secrets (only the path to the key file, and
   toggles).
-- **`cohere-status`** probes `/healthz` (unauth) and returns correct
+- **`stt-server --status`** probes `/healthz` (unauth) and returns correct
   OK/FAIL.
 
 Codex has full filesystem read in `-s read-only` (we verified this
