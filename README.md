@@ -177,15 +177,6 @@ curl -X POST http://127.0.0.1:8765/v1/audio/transcriptions \
   -F "language=en"
 ```
 
-## Remote access via Cloudflare Tunnel
-
-See [`docs/remote-access.md`](docs/remote-access.md) for the full
-security design for exposing this server to the internet through a
-Cloudflare tunnel with bearer-token auth, pre-parse body size caps,
-and symlink-safe key storage. That doc is structured as an implementation
-plan — run it through Claude Code, Codex, or execute the runbook
-manually on the host you want to tunnel from.
-
 ## Architecture
 
 Thin FastAPI wrapper around `mlx_audio.stt.load(...).generate(path, language=...)`:
