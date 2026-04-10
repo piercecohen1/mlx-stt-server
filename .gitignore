@@ -5,3 +5,7 @@ __pycache__/
 venv/
 .env
 .DS_Store
+
+# Claude Code harness state (settings, plans, etc.) is machine-local.
+# Checked-in design docs live under docs/ instead.
+.claude/
