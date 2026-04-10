@@ -14,6 +14,10 @@ mlx-audio STT model works via `--model`.
 ## Files
 
 - `server.py` — the entire server. ~240 lines. No package structure; run directly.
+- `scripts/cohere` — bash wrapper with `start|stop|restart|status|logs`
+  subcommands. Uses `nohup` + PID file so the server persists across terminal
+  close. Invoked via the `cohere-start` / `cohere-stop` / etc. aliases in
+  `~/.zshrc`. PID + log live under `~/.cache/cohere-stt/`.
 - `requirements.txt` — `mlx-audio[stt,server]` + FastAPI stack.
 - `README.md` — user-facing docs (setup, Spokenly config, curl smoke test).
 - `CLAUDE.md` — this file.
@@ -111,10 +115,25 @@ When reading mlx-audio internals for this project, the relevant files are:
 
 ## Running persistently
 
-Pierce was considering launchd vs ad-hoc. As of the last session he hadn't
-picked. If he asks to set up launchd:
-- Plist goes at `~/Library/LaunchAgents/com.piercecohen.mlx-stt-server.plist`
-- `RunAtLoad=true`, `KeepAlive=true`
-- Log to `~/Library/Logs/mlx-stt-server.log`
-- **Ask which Python interpreter to use** before writing the plist — system
-  `python` vs a venv makes a huge difference.
+Pierce went with the ad-hoc wrapper (`scripts/cohere` + shell aliases) rather
+than launchd. The model only sits resident while actively dictating — he
+spins it up via `cohere-start` and tears it down via `cohere-stop`. If he
+later wants always-on-at-login, a launchd plist is still the right upgrade
+path — but don't proactively add it without being asked.
+
+### `scripts/cohere` gotcha
+
+The wrapper uses `set -euo pipefail` + `nohup ... &` + `disown`. The empty
+extra-args array has to use the `${ARR[@]+"${ARR[@]}"}` safe-expansion
+pattern, because `set -u` on an empty `"${ARR[@]}"` will kill the
+backgrounded child before it exec's python. Don't "simplify" that line.
+
+### Orphan PID caveat
+
+If a previous `python server.py` session is still holding port 8765, a new
+`cohere-start` will succeed (nohup doesn't error on EADDRINUSE — uvicorn
+does), the backgrounded python will die seconds later, and the PID file
+will be stale. Symptom: `cohere-status` says "not running" but `curl
+http://127.0.0.1:8765/v1/models` still works. Fix: `lsof -iTCP:8765
+-sTCP:LISTEN`, kill the real pid, `rm ~/.cache/cohere-stt/server.pid`,
+retry `cohere-start`.

@@ -38,6 +38,26 @@ python server.py --model mlx-community/whisper-large-v3-turbo
 The first run downloads the model from Hugging Face (~4 GB for Cohere
 Transcribe). Subsequent runs load from the local HF cache.
 
+### Background via shell aliases
+
+`scripts/cohere` wraps the server in a `nohup` + PID-file harness so it
+survives terminal close. The repo installs these aliases in `~/.zshrc`:
+
+```bash
+cohere-start     # nohup the server, record PID, return immediately
+cohere-stop      # SIGTERM the recorded PID (SIGKILL after 10s)
+cohere-restart   # stop + start
+cohere-status    # shows PID + health check against /v1/models
+cohere-logs      # tail -f the server log
+```
+
+State lives in `~/.cache/cohere-stt/`:
+- `server.pid` — current PID (removed on stop)
+- `server.log` — appended stdout/stderr
+
+Overrides via env vars: `COHERE_STT_PORT`, `COHERE_STT_PYTHON`,
+`COHERE_STT_MODEL`, `COHERE_STT_PID_FILE`, `COHERE_STT_LOG_FILE`.
+
 ## Point Spokenly at it
 
 In Spokenly's Custom / OpenAI-Compatible API settings:

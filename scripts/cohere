@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# cohere — start/stop/status helper for the mlx-cohere STT server.
+#
+# Usage:
+#   cohere start | stop | restart | status | logs
+#
+# Backgrounds the server via nohup so it survives terminal close. PID is
+# tracked in $PID_FILE; stdout/stderr append to $LOG_FILE.
+#
+# Env overrides:
+#   COHERE_STT_PORT       default: 8765
+#   COHERE_STT_PYTHON     default: repo .venv/bin/python if present, else `python`
+#   COHERE_STT_MODEL      default: (server.py default, currently Cohere Transcribe)
+#   COHERE_STT_PID_FILE   default: ~/.cache/cohere-stt/server.pid
+#   COHERE_STT_LOG_FILE   default: ~/.cache/cohere-stt/server.log
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(dirname "$SCRIPT_DIR")"
+
+PORT="${COHERE_STT_PORT:-8765}"
+PID_FILE="${COHERE_STT_PID_FILE:-$HOME/.cache/cohere-stt/server.pid}"
+LOG_FILE="${COHERE_STT_LOG_FILE:-$HOME/.cache/cohere-stt/server.log}"
+
+if [[ -n "${COHERE_STT_PYTHON:-}" ]]; then
+    PYTHON_BIN="$COHERE_STT_PYTHON"
+elif [[ -x "$REPO_DIR/.venv/bin/python" ]]; then
+    PYTHON_BIN="$REPO_DIR/.venv/bin/python"
+elif [[ -x "$REPO_DIR/venv/bin/python" ]]; then
+    PYTHON_BIN="$REPO_DIR/venv/bin/python"
+else
+    PYTHON_BIN="python"
+fi
+
+EXTRA_ARGS=()
+if [[ -n "${COHERE_STT_MODEL:-}" ]]; then
+    EXTRA_ARGS+=(--model "$COHERE_STT_MODEL")
+fi
+
+mkdir -p "$(dirname "$PID_FILE")" "$(dirname "$LOG_FILE")"
+
+is_running() {
+    [[ -f "$PID_FILE" ]] || return 1
+    local pid
+    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    [[ -n "$pid" ]] || return 1
+    kill -0 "$pid" 2>/dev/null
+}
+
+cmd_start() {
+    if is_running; then
+        echo "cohere-stt: already running (pid $(cat "$PID_FILE")) on :$PORT"
+        return 0
+    fi
+    echo "cohere-stt: starting on :$PORT"
+    echo "cohere-stt:   python: $PYTHON_BIN"
+    echo "cohere-stt:   log:    $LOG_FILE"
+    cd "$REPO_DIR"
+    nohup "$PYTHON_BIN" server.py --port "$PORT" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} >> "$LOG_FILE" 2>&1 &
+    local pid=$!
+    disown "$pid" 2>/dev/null || true
+    echo "$pid" > "$PID_FILE"
+    echo "cohere-stt: started pid $pid (preloading model; cohere-status in ~5s)"
+}
+
+cmd_stop() {
+    if ! is_running; then
+        echo "cohere-stt: not running"
+        rm -f "$PID_FILE"
+        return 0
+    fi
+    local pid
+    pid="$(cat "$PID_FILE")"
+    echo "cohere-stt: stopping pid $pid"
+    kill "$pid" 2>/dev/null || true
+    for _ in $(seq 1 40); do
+        if ! kill -0 "$pid" 2>/dev/null; then break; fi
+        sleep 0.25
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "cohere-stt: graceful shutdown timed out, sending SIGKILL"
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$PID_FILE"
+    echo "cohere-stt: stopped"
+}
+
+cmd_status() {
+    if is_running; then
+        local pid
+        pid="$(cat "$PID_FILE")"
+        echo "cohere-stt: running pid $pid on :$PORT"
+        if curl -sf "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1; then
+            echo "cohere-stt: health OK"
+        else
+            echo "cohere-stt: health FAIL (model may still be loading — retry in a few seconds)"
+            return 1
+        fi
+    else
+        echo "cohere-stt: not running"
+        return 1
+    fi
+}
+
+cmd_restart() {
+    cmd_stop
+    cmd_start
+}
+
+cmd_logs() {
+    if [[ ! -f "$LOG_FILE" ]]; then
+        echo "cohere-stt: no log at $LOG_FILE"
+        return 1
+    fi
+    tail -f "$LOG_FILE"
+}
+
+case "${1:-}" in
+    start)   cmd_start ;;
+    stop)    cmd_stop ;;
+    status)  cmd_status ;;
+    restart) cmd_restart ;;
+    logs)    cmd_logs ;;
+    *)
+        echo "usage: $(basename "$0") {start|stop|status|restart|logs}" >&2
+        exit 2
+        ;;
+esac
