@@ -27,8 +27,34 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 
 # Source env file BEFORE deriving PORT/PYTHON_BIN/etc. so overrides win.
+#
+# The env file is `source`d as shell, which means anything in it runs as
+# the current user. Before sourcing, refuse any env file that isn't owned
+# by us, is a symlink, or is group/world-writable — matching the hygiene
+# the server applies to the key file itself. A local process that can plant
+# a file at ~/.config/mlx-stt-server/env should NOT achieve code execution
+# when the wrapper is invoked.
 ENV_FILE="${STT_SERVER_ENV_FILE:-$HOME/.config/mlx-stt-server/env}"
-if [[ -f "$ENV_FILE" ]]; then
+if [[ -e "$ENV_FILE" ]]; then
+    if [[ -L "$ENV_FILE" ]]; then
+        echo "stt-server: refusing to source symlinked env file $ENV_FILE" >&2
+        exit 1
+    fi
+    if [[ ! -f "$ENV_FILE" ]]; then
+        echo "stt-server: env file $ENV_FILE is not a regular file" >&2
+        exit 1
+    fi
+    env_owner=$(stat -f %u "$ENV_FILE")
+    if [[ "$env_owner" != "$(id -u)" ]]; then
+        echo "stt-server: refusing env file $ENV_FILE (uid $env_owner != $(id -u))" >&2
+        exit 1
+    fi
+    env_mode=$(stat -f %Lp "$ENV_FILE")
+    # Reject any group- or world-writable env file (octal mode bits 022).
+    if (( 8#$env_mode & 8#22 )); then
+        echo "stt-server: refusing env file $ENV_FILE (mode $env_mode, group/world writable)" >&2
+        exit 1
+    fi
     set -a
     # shellcheck disable=SC1090
     source "$ENV_FILE"

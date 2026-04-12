@@ -14,6 +14,8 @@ With auth (requires ~/.config/mlx-stt-server/api-key):
 from __future__ import annotations
 
 import argparse
+import asyncio
+import inspect
 import os
 import secrets
 import sys
@@ -31,7 +33,14 @@ from mlx_audio.stt import load as load_stt_model
 
 DEFAULT_MODEL = "CohereLabs/cohere-transcribe-03-2026"
 
+# Serialize model.generate() calls. The model holds GPU state and MLX is
+# not designed for concurrent invocations; without this, a burst of authed
+# requests can wedge the daemon. Requests queue in Starlette's event loop
+# and each gets its turn at the semaphore.
+_generate_semaphore = asyncio.Semaphore(1)
+
 _model_cache: dict = {}
+_model_accepts_language: dict = {}
 _preload_model: Optional[str] = os.environ.get("MLX_STT_MODEL", DEFAULT_MODEL)
 if os.environ.get("MLX_STT_NO_PRELOAD", "").lower() in ("1", "true", "yes"):
     _preload_model = None
@@ -39,9 +48,15 @@ if os.environ.get("MLX_STT_NO_PRELOAD", "").lower() in ("1", "true", "yes"):
 
 def get_model(model_id: str):
     if model_id not in _model_cache:
-        print(f"[mlx-stt-server] loading model: {model_id}", flush=True)
+        print(f"[mlx-stt-server] loading model: {model_id!r}", flush=True)
         t0 = time.time()
-        _model_cache[model_id] = load_stt_model(model_id)
+        model = load_stt_model(model_id)
+        try:
+            sig = inspect.signature(model.generate)
+            _model_accepts_language[model_id] = "language" in sig.parameters
+        except (ValueError, TypeError):
+            _model_accepts_language[model_id] = False
+        _model_cache[model_id] = model
         print(
             f"[mlx-stt-server] loaded {model_id} in {time.time() - t0:.1f}s",
             flush=True,
@@ -81,7 +96,7 @@ _API_KEY: Optional[str] = _load_api_key()
 
 # ── ASGI middlewares ─────────────────────────────────────────────────
 
-MAX_UPLOAD_BYTES = int(os.environ.get("MLX_STT_MAX_UPLOAD_MB", "100")) * 1024 * 1024
+MAX_UPLOAD_BYTES = int(os.environ.get("MLX_STT_MAX_UPLOAD_MB", "25")) * 1024 * 1024
 UNAUTH_PATHS: frozenset[str] = frozenset({"/healthz"})
 
 
@@ -346,29 +361,60 @@ async def create_transcription(
     Accepts the same multipart/form-data shape as OpenAI:
         file, model, language, prompt, response_format, temperature
     Supported response_format values: json, text, verbose_json, srt, vtt.
-    `prompt` and `temperature` are accepted for client compatibility but
-    ignored (the underlying Cohere model doesn't expose them).
+
+    The `model` form field is accepted for client compatibility but IGNORED:
+    the server only ever runs DEFAULT_MODEL. Accepting arbitrary model IDs
+    would let an authenticated client trigger code execution via mlx-audio
+    backends that pass trust_remote_code=True to transformers.from_pretrained.
+    `prompt` and `temperature` are similarly ignored (the Cohere model
+    doesn't expose them).
     """
     lang = (language or "en").lower()
 
+    # Bind tmp_path before writing so the outer finally can always clean up,
+    # even if the client disconnects mid-upload or file.read() raises.
     suffix = os.path.splitext(file.filename or "")[1] or ".wav"
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp.write(await file.read())
-        tmp_path = tmp.name
-
+    tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    tmp_path = tmp.name
     try:
         try:
-            stt_model = get_model(model)
-        except Exception as e:
-            print(f"[mlx-stt-server] load failed: {e}", file=sys.stderr, flush=True)
-            raise HTTPException(status_code=400, detail="Model unavailable")
+            # Stream in chunks instead of slurping the whole body into RAM.
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                tmp.write(chunk)
+        finally:
+            tmp.close()
 
         try:
-            result = stt_model.generate(tmp_path, language=lang)
-        except TypeError:
-            result = stt_model.generate(tmp_path)
+            stt_model = get_model(DEFAULT_MODEL)
         except Exception as e:
-            print(f"[mlx-stt-server] transcribe failed: {e}", file=sys.stderr, flush=True)
+            print(
+                f"[mlx-stt-server] load failed: {type(e).__name__}: {str(e)[:200]!r}",
+                file=sys.stderr,
+                flush=True,
+            )
+            raise HTTPException(status_code=400, detail="Model unavailable")
+        accepts_language = _model_accepts_language.get(DEFAULT_MODEL, False)
+
+        try:
+            # Serialize model.generate calls (MLX + GPU state is not
+            # designed for concurrent invocation) and offload to a thread
+            # so the event loop stays responsive for /healthz.
+            async with _generate_semaphore:
+                if accepts_language:
+                    result = await asyncio.to_thread(
+                        stt_model.generate, tmp_path, language=lang
+                    )
+                else:
+                    result = await asyncio.to_thread(stt_model.generate, tmp_path)
+        except Exception as e:
+            print(
+                f"[mlx-stt-server] transcribe failed: {type(e).__name__}: {str(e)[:200]!r}",
+                file=sys.stderr,
+                flush=True,
+            )
             raise HTTPException(status_code=500, detail="Transcription failed")
     finally:
         try:
