@@ -112,10 +112,6 @@ cmd_status() {
         echo "stt-server: running pid $pid on :$PORT"
         if curl -sf "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then
             echo "stt-server: health OK"
-        elif curl -sf "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1; then
-            # Backward compat with pre-remote-access server.py which had
-            # no /healthz. Remove once docs/remote-access.md is executed.
-            echo "stt-server: health OK (legacy /v1/models probe)"
         else
             echo "stt-server: health FAIL (model may still be loading — retry in a few seconds)"
             return 1
