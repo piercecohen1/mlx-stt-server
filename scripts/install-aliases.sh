@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 TARGET_SCRIPT="$REPO_DIR/scripts/stt-server"
 
