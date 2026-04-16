@@ -19,7 +19,7 @@
 # If the env file at $STT_SERVER_ENV_FILE exists it is sourced BEFORE the
 # variables above are resolved, so it can override any of them. This is
 # where you put non-secret toggles like MLX_STT_REQUIRE_KEY=1 for a
-# tunneled host. See README and docs/remote-access.md.
+# tunneled host. See the "Remote access" section in README.md.
 
 set -euo pipefail
 
@@ -168,8 +168,8 @@ usage: stt-server {--start|--stop|--restart|--status|--logs}
 Start/stop/inspect the mlx-stt-server. Flag form (--start) and bare form
 (start) are both accepted.
 
-See README.md for installation and docs/remote-access.md for the remote
-access / Cloudflare tunnel design.
+See README.md for installation and the "Remote access" section for
+bearer-token auth setup.
 EOF
     exit 2
 }
