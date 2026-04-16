@@ -96,7 +96,7 @@ _API_KEY: Optional[str] = _load_api_key()
 
 # ── ASGI middlewares ─────────────────────────────────────────────────
 
-MAX_UPLOAD_BYTES = int(os.environ.get("MLX_STT_MAX_UPLOAD_MB", "25")) * 1024 * 1024
+MAX_UPLOAD_BYTES = int(os.environ.get("MLX_STT_MAX_UPLOAD_MB", "500")) * 1024 * 1024
 UNAUTH_PATHS: frozenset[str] = frozenset({"/healthz"})
 
 

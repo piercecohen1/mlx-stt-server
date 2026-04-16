@@ -177,6 +177,56 @@ curl -X POST http://127.0.0.1:8765/v1/audio/transcriptions \
   -F "language=en"
 ```
 
+## Remote access (optional auth)
+
+For local-only use, skip this section — the server listens on
+`127.0.0.1` with no auth by default, which is the right setup for
+dictation on your own machine.
+
+To expose the server beyond loopback (LAN, Tailscale, Cloudflare
+Tunnel, etc.), enable bearer-token auth by creating a key file:
+
+```bash
+umask 077
+mkdir -p ~/.config/mlx-stt-server
+openssl rand -hex 32 > ~/.config/mlx-stt-server/api-key
+chmod 600 ~/.config/mlx-stt-server/api-key
+```
+
+The server auto-detects the key file at startup. To refuse startup
+when the file is missing or empty (recommended on any tunneled host):
+
+```bash
+python server.py --require-key
+# or, equivalently
+MLX_STT_REQUIRE_KEY=1 python server.py
+```
+
+Clients send the token in the `Authorization` header:
+
+```bash
+curl -X POST https://your-host/v1/audio/transcriptions \
+  -H "Authorization: Bearer $(cat ~/.config/mlx-stt-server/api-key)" \
+  -F "file=@samples/test.m4a" \
+  -F "model=CohereLabs/cohere-transcribe-03-2026"
+```
+
+`/healthz` is always open (so tunnel health probes don't need
+credentials). Every other endpoint returns 401 without a valid
+bearer token when a key is loaded.
+
+Environment knobs:
+
+| Variable                 | Default                             | Purpose                                                             |
+| ---                      | ---                                 | ---                                                                 |
+| `MLX_STT_API_KEY_FILE`   | `~/.config/mlx-stt-server/api-key`  | Override the key-file path.                                         |
+| `MLX_STT_REQUIRE_KEY`    | `0`                                 | Set to `1` to refuse startup without a valid key file.              |
+| `MLX_STT_MAX_UPLOAD_MB`  | `500`                               | Body-size cap enforced before form parsing (returns 413 over cap).  |
+
+Rotate the token by atomically overwriting the key file (`mktemp` in
+the same dir → `chmod 600` → `mv -f`); the server re-reads it at
+startup only, so you need to restart after rotation.
+
 ## Architecture
 
 Thin FastAPI wrapper around `mlx_audio.stt.load(...).generate(path, language=...)`:
@@ -212,7 +262,5 @@ default Cohere model).
 
 ## License
 
-No license file committed. All the code here is a thin bridge between
-mlx-audio (MIT) and OpenAI's well-documented audio API shape. Treat it
-as reference / example code until a formal license is added; if you'd
-like me to add one (MIT or Apache-2.0 are both fine), open an issue.
+MIT — see [LICENSE](LICENSE). mlx-audio, which this server wraps, is
+also MIT-licensed.
