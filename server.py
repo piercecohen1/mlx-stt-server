@@ -99,6 +99,14 @@ _API_KEY: Optional[str] = _load_api_key()
 MAX_UPLOAD_BYTES = int(os.environ.get("MLX_STT_MAX_UPLOAD_MB", "500")) * 1024 * 1024
 UNAUTH_PATHS: frozenset[str] = frozenset({"/healthz"})
 
+# When enabled, each successful request logs the transcribed text (not just
+# timing/metadata). Off by default so routine dictation isn't written to the
+# log file; flip it on with --log-transcripts / MLX_STT_LOG_TRANSCRIPTS=1
+# for demos or debugging.
+_LOG_TRANSCRIPTS = os.environ.get("MLX_STT_LOG_TRANSCRIPTS", "").lower() in (
+    "1", "true", "yes",
+)
+
 
 class AuthMiddleware:
     """Reject requests without a valid Bearer token before routing."""
@@ -403,12 +411,14 @@ async def create_transcription(
             # designed for concurrent invocation) and offload to a thread
             # so the event loop stays responsive for /healthz.
             async with _generate_semaphore:
+                t0 = time.time()
                 if accepts_language:
                     result = await asyncio.to_thread(
                         stt_model.generate, tmp_path, language=lang
                     )
                 else:
                     result = await asyncio.to_thread(stt_model.generate, tmp_path)
+                elapsed = time.time() - t0
         except Exception as e:
             print(
                 f"[mlx-stt-server] transcribe failed: {type(e).__name__}: {str(e)[:200]!r}",
@@ -423,6 +433,20 @@ async def create_transcription(
             pass
 
     fmt = (response_format or "json").lower()
+
+    # One line per request so `stt-server --logs` shows live activity.
+    # Metadata is always logged; the transcribed text only when opted in.
+    text = result.text or ""
+    if _LOG_TRANSCRIPTS:
+        tail = f' → "{" ".join(text.split())}"'
+    else:
+        tail = f" ({len(text)} chars)"
+    print(
+        f"[mlx-stt-server] {time.strftime('%H:%M:%S')} transcribe ok "
+        f"in {elapsed:.2f}s lang={lang} fmt={fmt}{tail}",
+        flush=True,
+    )
+
     if fmt == "text":
         return PlainTextResponse(result.text)
     if fmt == "srt":
@@ -456,7 +480,7 @@ async def create_translation(
 
 
 def main():
-    global _preload_model
+    global _preload_model, _LOG_TRANSCRIPTS
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
@@ -475,11 +499,18 @@ def main():
         action="store_true",
         help="Refuse to start if no valid API key file is found.",
     )
+    parser.add_argument(
+        "--log-transcripts",
+        action="store_true",
+        help="Log the transcribed text of each request (off by default).",
+    )
     args = parser.parse_args()
 
     _preload_model = None if args.no_preload else args.model
     if args.require_key:
         os.environ["MLX_STT_REQUIRE_KEY"] = "1"
+    if args.log_transcripts:
+        _LOG_TRANSCRIPTS = True
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 
