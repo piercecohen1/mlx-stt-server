@@ -223,6 +223,7 @@ Environment knobs:
 | `MLX_STT_REQUIRE_KEY`    | `0`                                 | Set to `1` to refuse startup without a valid key file.              |
 | `MLX_STT_MAX_UPLOAD_MB`  | `500`                               | Body-size cap enforced before form parsing (returns 413 over cap).  |
 | `MLX_STT_LOG_TRANSCRIPTS`| `0`                                 | Set to `1` to log each request's transcribed text (also `--log-transcripts`). Off by default so routine dictation isn't written to the log. |
+| `MLX_STT_LOG_VERBOSE`    | `0`                                 | Set to `1` for a colorized, multi-line per-request log block — request lifecycle + inference metrics, no transcript (also `--log-verbose`). Pairs well with `stt-server --logs` for a live demo. Honors `NO_COLOR`. |
 
 Rotate the token by atomically overwriting the key file (`mktemp` in
 the same dir → `chmod 600` → `mv -f`); the server re-reads it at

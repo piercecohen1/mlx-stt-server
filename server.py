@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import inspect
+import itertools
 import os
 import secrets
 import sys
@@ -106,6 +107,32 @@ UNAUTH_PATHS: frozenset[str] = frozenset({"/healthz"})
 _LOG_TRANSCRIPTS = os.environ.get("MLX_STT_LOG_TRANSCRIPTS", "").lower() in (
     "1", "true", "yes",
 )
+
+# Verbose "behind the scenes" logging: a colorized, multi-line block per
+# request showing the request lifecycle and inference metrics (but not the
+# transcript). Great for a live `stt-server --logs` display during a demo.
+# Off by default; enable with --log-verbose / MLX_STT_LOG_VERBOSE=1.
+_LOG_VERBOSE = os.environ.get("MLX_STT_LOG_VERBOSE", "").lower() in (
+    "1", "true", "yes",
+)
+
+# Honor the NO_COLOR convention (https://no-color.org/) so the verbose log
+# degrades to plain text when piped somewhere that can't render ANSI.
+_NO_COLOR = bool(os.environ.get("NO_COLOR"))
+_req_counter = itertools.count(1)
+
+
+def _c(code: str, text: str) -> str:
+    """Wrap text in an ANSI SGR sequence unless color is disabled."""
+    return text if _NO_COLOR else f"\033[{code}m{text}\033[0m"
+
+
+def _human_size(n: int) -> str:
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n / (1024 * 1024):.1f} MB"
 
 
 class AuthMiddleware:
@@ -288,6 +315,60 @@ def _verbose_json(result, language: str) -> dict:
     }
 
 
+# ── Request logging ──────────────────────────────────────────────────
+
+def _log_request_start(req_no, filename, nbytes, lang, fmt, resident):
+    """Phase 1: log the incoming request. Verbose mode only — emits a
+    header + 'transcribing…' so the live tail reacts the moment audio
+    arrives, before inference finishes."""
+    if not _LOG_VERBOSE:
+        return
+    bar = _c("90", "━" * 3 + f" {time.strftime('%H:%M:%S')} · req #{req_no} " + "━" * 24)
+    state = "resident" if resident else "cold-loading"
+    print(
+        "\n  " + bar
+        + "\n  " + _c("96;1", "◂ audio   ") + f"{filename or 'upload'}  "
+        + _c("90", "·") + f" {_human_size(nbytes)}  "
+        + _c("90", "·") + f" {lang}/{fmt}"
+        + "\n  " + _c("90", "· model   ") + DEFAULT_MODEL
+        + _c("90", f"  ({state} · Apple GPU / MLX)")
+        + "\n  " + _c("93", "· transcribing…"),
+        flush=True,
+    )
+
+
+def _log_request_done(req_no, elapsed, result, lang, fmt):
+    """Phase 2: log the result metrics (timing, realtime factor, counts).
+    Falls back to a concise one-liner when verbose mode is off."""
+    text = result.text or ""
+    words, chars = len(text.split()), len(text)
+    segs = _segments(result)
+    duration = float(segs[-1]["end"]) if segs else None
+
+    if not _LOG_VERBOSE:
+        if _LOG_TRANSCRIPTS:
+            tail = f' → "{" ".join(text.split())}"'
+        else:
+            tail = f" ({chars} chars)"
+        print(
+            f"[mlx-stt-server] {time.strftime('%H:%M:%S')} transcribe ok "
+            f"in {elapsed:.2f}s lang={lang} fmt={fmt}{tail}",
+            flush=True,
+        )
+        return
+
+    parts = [_c("1", f"{elapsed:.2f}s")]
+    if duration and elapsed > 0:
+        parts.append(_c("92;1", f"{duration / elapsed:.1f}× realtime"))
+    counts = f"{words} words · {chars} chars" + (f" · {len(segs)} seg" if segs else "")
+    parts.append(counts)
+    sep = _c("90", "   ·   ")
+    out = "  " + _c("92;1", "▸ done    ") + sep.join(parts)
+    if _LOG_TRANSCRIPTS:
+        out += "\n  " + _c("90", "· text    ") + '"' + " ".join(text.split()) + '"'
+    print(out, flush=True)
+
+
 # ── App setup ────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -378,12 +459,14 @@ async def create_transcription(
     doesn't expose them).
     """
     lang = (language or "en").lower()
+    req_no = next(_req_counter)
 
     # Bind tmp_path before writing so the outer finally can always clean up,
     # even if the client disconnects mid-upload or file.read() raises.
     suffix = os.path.splitext(file.filename or "")[1] or ".wav"
     tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
     tmp_path = tmp.name
+    upload_bytes = 0
     try:
         try:
             # Stream in chunks instead of slurping the whole body into RAM.
@@ -391,9 +474,16 @@ async def create_transcription(
                 chunk = await file.read(1024 * 1024)
                 if not chunk:
                     break
+                upload_bytes += len(chunk)
                 tmp.write(chunk)
         finally:
             tmp.close()
+
+        resident = DEFAULT_MODEL in _model_cache
+        _log_request_start(
+            req_no, file.filename, upload_bytes, lang,
+            (response_format or "json").lower(), resident,
+        )
 
         try:
             stt_model = get_model(DEFAULT_MODEL)
@@ -433,19 +523,7 @@ async def create_transcription(
             pass
 
     fmt = (response_format or "json").lower()
-
-    # One line per request so `stt-server --logs` shows live activity.
-    # Metadata is always logged; the transcribed text only when opted in.
-    text = result.text or ""
-    if _LOG_TRANSCRIPTS:
-        tail = f' → "{" ".join(text.split())}"'
-    else:
-        tail = f" ({len(text)} chars)"
-    print(
-        f"[mlx-stt-server] {time.strftime('%H:%M:%S')} transcribe ok "
-        f"in {elapsed:.2f}s lang={lang} fmt={fmt}{tail}",
-        flush=True,
-    )
+    _log_request_done(req_no, elapsed, result, lang, fmt)
 
     if fmt == "text":
         return PlainTextResponse(result.text)
@@ -480,7 +558,7 @@ async def create_translation(
 
 
 def main():
-    global _preload_model, _LOG_TRANSCRIPTS
+    global _preload_model, _LOG_TRANSCRIPTS, _LOG_VERBOSE
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
@@ -504,6 +582,11 @@ def main():
         action="store_true",
         help="Log the transcribed text of each request (off by default).",
     )
+    parser.add_argument(
+        "--log-verbose",
+        action="store_true",
+        help="Verbose, colorized per-request log block (great for live demos).",
+    )
     args = parser.parse_args()
 
     _preload_model = None if args.no_preload else args.model
@@ -511,6 +594,8 @@ def main():
         os.environ["MLX_STT_REQUIRE_KEY"] = "1"
     if args.log_transcripts:
         _LOG_TRANSCRIPTS = True
+    if args.log_verbose:
+        _LOG_VERBOSE = True
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 
