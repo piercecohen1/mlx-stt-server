@@ -30,6 +30,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+import mlx.core as mx
 from mlx_audio.stt import load as load_stt_model
 
 DEFAULT_MODEL = "CohereLabs/cohere-transcribe-03-2026"
@@ -502,12 +503,22 @@ async def create_transcription(
             # so the event loop stays responsive for /healthz.
             async with _generate_semaphore:
                 t0 = time.time()
-                if accepts_language:
-                    result = await asyncio.to_thread(
-                        stt_model.generate, tmp_path, language=lang
-                    )
-                else:
-                    result = await asyncio.to_thread(stt_model.generate, tmp_path)
+                try:
+                    if accepts_language:
+                        result = await asyncio.to_thread(
+                            stt_model.generate, tmp_path, language=lang
+                        )
+                    else:
+                        result = await asyncio.to_thread(stt_model.generate, tmp_path)
+                finally:
+                    # Release MLX's Metal buffer cache after every request.
+                    # The cache is bounded only by a default limit near total
+                    # system RAM, and variable-length audio means cached
+                    # buffers rarely match future allocations, so it grows by
+                    # gigabytes over a day of dictation and gets swapped out.
+                    # Model weights stay resident; clearing is near-free and
+                    # a warmed request still completes in under 0.2s.
+                    mx.clear_cache()
                 elapsed = time.time() - t0
         except Exception as e:
             print(
