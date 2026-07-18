@@ -247,6 +247,29 @@ The model only loads once per process, so first-request latency is
 just inference (~0.7 s for a 35 s clip on an M-series Mac with the
 default Cohere model).
 
+## Memory footprint
+
+Expect the server process to sit at roughly 4 GB with the default
+Cohere model loaded: about 3.9 GB of model weights resident in unified
+memory, plus a couple hundred MB of Python runtime. The footprint
+stays flat across requests because the server releases MLX's Metal
+buffer cache after every transcription. That cache is bounded only by
+a default limit near total system RAM, and variable-length audio means
+cached buffers are rarely reused, so an uncleared cache grows by
+gigabytes over a day of dictation and eventually gets swapped out,
+which shows up as multi-second latency on the first request after an
+idle period.
+
+To check the live footprint, use Activity Monitor or:
+
+```bash
+top -l 1 -pid $(cat ~/.cache/mlx-stt-server/server.pid) -stats mem
+```
+
+macOS `ps` under-reports it because the weights live in Metal regions.
+A process climbing well past ~5 GB means the per-request
+`mx.clear_cache()` in `server.py` has stopped doing its job.
+
 ## Known limitations
 
 - Cohere Transcribe is ASR only — `/v1/audio/translations` is a
