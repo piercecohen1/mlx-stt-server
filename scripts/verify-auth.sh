@@ -95,15 +95,15 @@ MLX_STT_API_KEY_FILE=/nonexistent/mlx-stt-server-key \
     python server.py --no-preload &
 SRV=$!
 sleep 1
-assert_code 200 http://127.0.0.1:8765/healthz
-assert_code 200 http://127.0.0.1:8765/v1/models
+assert_code 200 http://127.0.0.1:18765/healthz
+assert_code 200 http://127.0.0.1:18765/v1/models
 # FastAPI docs/openapi must be disabled — check all four auto-routes
-assert_code 404 http://127.0.0.1:8765/docs
-assert_code 404 http://127.0.0.1:8765/openapi.json
-assert_code 404 http://127.0.0.1:8765/redoc
-assert_code 404 http://127.0.0.1:8765/docs/oauth2-redirect
+assert_code 404 http://127.0.0.1:18765/docs
+assert_code 404 http://127.0.0.1:18765/openapi.json
+assert_code 404 http://127.0.0.1:18765/redoc
+assert_code 404 http://127.0.0.1:18765/docs/oauth2-redirect
 # Old disclosive root is gone
-assert_code 404 http://127.0.0.1:8765/
+assert_code 404 http://127.0.0.1:18765/
 kill "$SRV"; wait "$SRV" 2>/dev/null || true
 SRV=""
 
@@ -169,27 +169,27 @@ printf 'header = "Authorization: Bearer not-the-real-key"\n' > "$BAD_CONF"
 CURL_CONFS+=("$BAD_CONF")
 
 # /healthz is always open
-assert_code 200 http://127.0.0.1:8765/healthz
+assert_code 200 http://127.0.0.1:18765/healthz
 # GET /v1/models — auth required
-assert_code 401 http://127.0.0.1:8765/v1/models
-assert_code 401 http://127.0.0.1:8765/v1/models -K "$BAD_CONF"
-assert_code 200 http://127.0.0.1:8765/v1/models -K "$AUTH_CONF"
+assert_code 401 http://127.0.0.1:18765/v1/models
+assert_code 401 http://127.0.0.1:18765/v1/models -K "$BAD_CONF"
+assert_code 200 http://127.0.0.1:18765/v1/models -K "$AUTH_CONF"
 # POST /v1/audio/transcriptions — auth required (missing from earlier passes)
-assert_code 401 http://127.0.0.1:8765/v1/audio/transcriptions \
+assert_code 401 http://127.0.0.1:18765/v1/audio/transcriptions \
     -X POST -F "file=@$AUDIO"
-assert_code 401 http://127.0.0.1:8765/v1/audio/transcriptions \
+assert_code 401 http://127.0.0.1:18765/v1/audio/transcriptions \
     -X POST -F "file=@$AUDIO" -K "$BAD_CONF"
 # POST /v1/audio/translations — auth required
-assert_code 401 http://127.0.0.1:8765/v1/audio/translations \
+assert_code 401 http://127.0.0.1:18765/v1/audio/translations \
     -X POST -F "file=@$AUDIO"
-assert_code 401 http://127.0.0.1:8765/v1/audio/translations \
+assert_code 401 http://127.0.0.1:18765/v1/audio/translations \
     -X POST -F "file=@$AUDIO" -K "$BAD_CONF"
 
 # ---------------------------------------------------------------------------
 # 5. Real transcription through auth — uses curl -K, token not in argv
 # ---------------------------------------------------------------------------
 curl -fsS -K "$AUTH_CONF" -X POST \
-    http://127.0.0.1:8765/v1/audio/transcriptions \
+    http://127.0.0.1:18765/v1/audio/transcriptions \
     -F "file=@$AUDIO" \
     -F "model=CohereLabs/cohere-transcribe-03-2026" \
     -F "language=en" >/dev/null && echo "OK:   real transcription"
@@ -199,7 +199,7 @@ curl -fsS -K "$AUTH_CONF" -X POST \
 # ---------------------------------------------------------------------------
 BIGWAV=$(mktemp -t big.XXXXXX.wav)
 dd if=/dev/zero of="$BIGWAV" bs=1m count=150 >/dev/null 2>&1
-assert_code 413 http://127.0.0.1:8765/v1/audio/transcriptions \
+assert_code 413 http://127.0.0.1:18765/v1/audio/transcriptions \
     -X POST -K "$AUTH_CONF" -F "file=@$BIGWAV"
 rm -f "$BIGWAV"; BIGWAV=""
 
@@ -223,7 +223,7 @@ STT_SERVER_ENV_FILE="$TEST_ENV_FILE" ./scripts/stt-server start
 sleep 5
 STT_SERVER_ENV_FILE="$TEST_ENV_FILE" ./scripts/stt-server status
 
-# Prove the port override took effect — server is on 8766, not 8765
+# Prove the port override took effect — server is on 8766, not 18765
 assert_code 200 http://127.0.0.1:8766/healthz
 assert_code 401 http://127.0.0.1:8766/v1/models
 assert_code 200 http://127.0.0.1:8766/v1/models -K "$AUTH_CONF"

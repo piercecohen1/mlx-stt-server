@@ -9,7 +9,7 @@
 # tracked in $PID_FILE; stdout/stderr append to $LOG_FILE.
 #
 # Env overrides:
-#   STT_SERVER_PORT       default: 8765
+#   STT_SERVER_PORT       default: 18765
 #   STT_SERVER_PYTHON     default: repo .venv/bin/python if present, else `python`
 #   STT_SERVER_MODEL      default: (server.py default, currently Cohere Transcribe)
 #   STT_SERVER_PID_FILE   default: ~/.cache/mlx-stt-server/server.pid
@@ -61,7 +61,7 @@ if [[ -e "$ENV_FILE" ]]; then
     set +a
 fi
 
-PORT="${STT_SERVER_PORT:-8765}"
+PORT="${STT_SERVER_PORT:-18765}"
 PID_FILE="${STT_SERVER_PID_FILE:-$HOME/.cache/mlx-stt-server/server.pid}"
 LOG_FILE="${STT_SERVER_LOG_FILE:-$HOME/.cache/mlx-stt-server/server.log}"
 

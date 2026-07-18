@@ -15,10 +15,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import inspect
 import itertools
+import logging
 import os
 import secrets
+import signal
 import sys
 import tempfile
 import time
@@ -29,11 +32,21 @@ import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
+from uvicorn.config import LOGGING_CONFIG as _UVICORN_LOGGING_CONFIG
+from uvicorn.server import Server as _UvicornServer
 
 import mlx.core as mx
 from mlx_audio.stt import load as load_stt_model
 
 DEFAULT_MODEL = "CohereLabs/cohere-transcribe-03-2026"
+
+# Port 8765 is a common default for ad-hoc dev servers (notably
+# `python -m http.server`); picking something further up the range avoids
+# collisions with other tools that might `lsof -ti:PORT | xargs kill` for
+# cleanup. See the 2026-04-18 incident note in CLAUDE.md.
+DEFAULT_PORT = 18765
+
+_START_TIME = time.time()
 
 # Serialize model.generate() calls. The model holds GPU state and MLX is
 # not designed for concurrent invocations; without this, a burst of authed
@@ -370,6 +383,56 @@ def _log_request_done(req_no, elapsed, result, lang, fmt):
     print(out, flush=True)
 
 
+# ── Logging + shutdown diagnostics ───────────────────────────────────
+
+def _fmt_uptime() -> str:
+    elapsed = int(time.time() - _START_TIME)
+    h, rem = divmod(elapsed, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m{s:02d}s"
+    if m:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
+
+
+class LoggingServer(_UvicornServer):
+    """uvicorn.Server that records WHICH signal triggered a shutdown.
+
+    uvicorn's stock "Shutting down" message is identical for SIGINT, SIGTERM,
+    and SIGHUP, which made the 2026-04-18 mystery shutdown unnecessarily hard
+    to diagnose. Logging the signal name, pid/ppid, and uptime here gives a
+    future operator enough to correlate with `log show` / shell history.
+    """
+
+    def handle_exit(self, sig: int, frame) -> None:
+        try:
+            name = signal.Signals(sig).name
+        except ValueError:
+            name = f"signal {sig}"
+        logging.getLogger("uvicorn").warning(
+            "shutdown signal %s (pid=%d ppid=%d uptime=%s)",
+            name,
+            os.getpid(),
+            os.getppid(),
+            _fmt_uptime(),
+        )
+        super().handle_exit(sig, frame)
+
+
+def _build_log_config() -> dict:
+    """uvicorn's defaults have no timestamps; add ISO-8601 asctime so log
+    lines are trivially correlatable with `log show --start ...` output."""
+    cfg = copy.deepcopy(_UVICORN_LOGGING_CONFIG)
+    cfg["formatters"]["default"]["fmt"] = "%(asctime)s %(levelname)s %(message)s"
+    cfg["formatters"]["default"]["datefmt"] = "%Y-%m-%dT%H:%M:%S%z"
+    cfg["formatters"]["access"]["fmt"] = (
+        '%(asctime)s %(client_addr)s "%(request_line)s" %(status_code)s'
+    )
+    cfg["formatters"]["access"]["datefmt"] = "%Y-%m-%dT%H:%M:%S%z"
+    return cfg
+
+
 # ── App setup ────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -384,6 +447,11 @@ async def lifespan(app: FastAPI):
         )
     if _API_KEY is not None and len(_API_KEY) < 32:
         raise RuntimeError("API key must be at least 32 characters")
+    print(
+        f"[mlx-stt-server] started pid={os.getpid()} ppid={os.getppid()} "
+        f"python={sys.version.split()[0]}",
+        flush=True,
+    )
     print(f"auth: {'enabled' if _API_KEY else 'disabled'}", flush=True)
     if _preload_model:
         try:
@@ -572,7 +640,7 @@ def main():
     global _preload_model, _LOG_TRANSCRIPTS, _LOG_VERBOSE
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument(
         "--model",
         default=DEFAULT_MODEL,
@@ -607,7 +675,14 @@ def main():
         _LOG_TRANSCRIPTS = True
     if args.log_verbose:
         _LOG_VERBOSE = True
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    config = uvicorn.Config(
+        app,
+        host=args.host,
+        port=args.port,
+        log_level="info",
+        log_config=_build_log_config(),
+    )
+    LoggingServer(config).run()
 
 
 if __name__ == "__main__":

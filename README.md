@@ -4,7 +4,7 @@ Local OpenAI-compatible speech-to-text server that wraps
 [mlx-audio](https://github.com/Blaizzy/mlx-audio) on Apple Silicon.
 Exposes the subset of OpenAI's `/v1/audio/transcriptions` API that most
 dictation clients, transcription tools, and `openai` SDK wrappers call,
-so you can point any OpenAI-compatible client at `http://127.0.0.1:8765`
+so you can point any OpenAI-compatible client at `http://127.0.0.1:18765`
 and run inference locally on an M-series Mac with no cloud round-trip.
 
 Default model is [Cohere Transcribe
@@ -64,7 +64,7 @@ with a 401 from Hugging Face. You can swap to a non-gated model with
 ### Foreground (dev)
 
 ```bash
-python server.py                       # preloads default model on :8765
+python server.py                       # preloads default model on :18765
 python server.py --port 8123
 python server.py --no-preload          # load on first request instead
 python server.py --model mlx-community/whisper-large-v3-turbo
@@ -103,7 +103,7 @@ place.
 ## Point an OpenAI-compatible client at it
 
 Any tool that speaks the OpenAI audio API works. Base URL is
-`http://127.0.0.1:8765` — most clients append `/v1/audio/transcriptions`
+`http://127.0.0.1:18765` — most clients append `/v1/audio/transcriptions`
 themselves, so paste just the host. A few examples:
 
 ### `openai` Python SDK
@@ -111,7 +111,7 @@ themselves, so paste just the host. A few examples:
 ```python
 from openai import OpenAI
 client = OpenAI(
-    base_url="http://127.0.0.1:8765/v1",
+    base_url="http://127.0.0.1:18765/v1",
     api_key="local",   # anything works — not validated in local mode
 )
 with open("audio.wav", "rb") as f:
@@ -125,7 +125,7 @@ print(result.text)
 ### curl
 
 ```bash
-curl -X POST http://127.0.0.1:8765/v1/audio/transcriptions \
+curl -X POST http://127.0.0.1:18765/v1/audio/transcriptions \
   -F "file=@samples/test.m4a" \
   -F "model=CohereLabs/cohere-transcribe-03-2026" \
   -F "language=en" \
@@ -136,11 +136,11 @@ curl -X POST http://127.0.0.1:8765/v1/audio/transcriptions \
 
 | Field                | Value                                       |
 | ---                  | ---                                         |
-| Base URL / Endpoint  | `http://127.0.0.1:8765`                     |
+| Base URL / Endpoint  | `http://127.0.0.1:18765`                     |
 | API Key              | any non-empty string (e.g. `local`)         |
 | Model                | `CohereLabs/cohere-transcribe-03-2026`      |
 
-Some clients require the full `/v1` suffix (e.g. `http://127.0.0.1:8765/v1`),
+Some clients require the full `/v1` suffix (e.g. `http://127.0.0.1:18765/v1`),
 some append it automatically — if one form 404s, try the other.
 
 ## Supported API subset
@@ -169,9 +169,9 @@ The repo ships with a tiny synthesized test clip at `samples/test.m4a`
 out of the box without you supplying your own audio.
 
 ```bash
-curl http://127.0.0.1:8765/v1/models
+curl http://127.0.0.1:18765/v1/models
 
-curl -X POST http://127.0.0.1:8765/v1/audio/transcriptions \
+curl -X POST http://127.0.0.1:18765/v1/audio/transcriptions \
   -F "file=@samples/test.m4a" \
   -F "model=CohereLabs/cohere-transcribe-03-2026" \
   -F "language=en"
