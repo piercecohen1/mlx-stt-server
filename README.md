@@ -100,6 +100,29 @@ top of the script, so you can set `STT_SERVER_PORT`, `STT_SERVER_MODEL`,
 `STT_SERVER_PYTHON`, or any `MLX_STT_*` server-side variable in one
 place.
 
+### Start automatically at login
+
+```bash
+./scripts/install-launch-agent.sh              # install / update
+./scripts/install-launch-agent.sh --uninstall  # remove autostart
+```
+
+This writes a launchd LaunchAgent
+(`~/Library/LaunchAgents/com.mlx-stt-server.plist`) that runs
+`stt-server --start` when you log in, and loads it immediately, so the
+server also starts right away if it isn't running. The agent's own
+output goes to `~/.cache/mlx-stt-server/launchd.log`.
+
+launchd jobs run without your shell environment, so the installer
+resolves the Python interpreter and the directory containing `ffmpeg`
+at install time and pins both into the plist. Re-run the installer
+after moving the repo, switching Python versions, or reinstalling
+ffmpeg.
+
+The agent only starts the server; it does not supervise it. A crashed
+server stays down until the next login or a manual `stt-server
+--start`, and `stt-server --stop` keeps it stopped the same way.
+
 ## Point an OpenAI-compatible client at it
 
 Any tool that speaks the OpenAI audio API works. Base URL is

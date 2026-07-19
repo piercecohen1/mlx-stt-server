@@ -16,6 +16,15 @@ Shell alias → `scripts/stt-server`; listens on `127.0.0.1:18765` and
 keeps the model resident while up. The alias hard-codes an absolute
 path, so re-run `./scripts/install-aliases.sh` if you move the repo.
 
+Also starts at login via LaunchAgent `com.mlx-stt-server`, installed by
+`scripts/install-launch-agent.sh` (job output:
+`~/.cache/mlx-stt-server/launchd.log`). launchd has no shell
+environment, so the installer pins the concrete Python interpreter and
+ffmpeg's directory into the plist at install time — re-run it too after
+moving the repo, switching Python, or relocating ffmpeg. The plist
+needs `AbandonProcessGroup` because the wrapper daemonizes via nohup
+and exits; without it launchd kills the server on job exit.
+
 ## Memory footprint
 
 Steady state is ~4.1 GB: ~3.9 GB model weights resident in unified
