@@ -77,7 +77,9 @@ Transcribe). Subsequent runs load from the local HF cache in ~1 second.
 
 A wrapper script at `scripts/stt-server` backgrounds the server via
 `nohup`, tracks the PID in `~/.cache/mlx-stt-server/server.pid`, and
-appends logs to `~/.cache/mlx-stt-server/server.log`. One-time setup:
+appends logs to `~/.cache/mlx-stt-server/server.log`. Before reporting
+or stopping that PID, it verifies the process command and working
+directory and automatically discards stale PID files. One-time setup:
 
 ```bash
 ./scripts/install-aliases.sh

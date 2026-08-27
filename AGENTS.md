@@ -13,7 +13,10 @@ stt-server --start | --stop | --restart | --status | --logs
 ```
 
 Shell alias → `scripts/stt-server`; listens on `127.0.0.1:18765` and
-keeps the model resident while up. The alias hard-codes an absolute
+keeps the model resident while up. Before reporting or stopping the
+cached PID, the wrapper verifies its command and working directory and
+discards stale PID files. Its focused regression test is
+`scripts/test-stt-server-wrapper.sh`. The alias hard-codes an absolute
 path, so re-run `./scripts/install-aliases.sh` if you move the repo.
 
 Also starts at login via LaunchAgent `com.mlx-stt-server`, installed by
