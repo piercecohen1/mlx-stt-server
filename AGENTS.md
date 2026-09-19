@@ -46,6 +46,12 @@ Installed via `pip install mlx-audio[stt,server]`. To hack on it locally,
 point pip at the sibling checkout (`~/mlx/mlx-audio/`):
 `pip install -e ../mlx-audio[stt,server]`.
 
+Known-good versions: mlx 0.31.1 + mlx-audio 0.4.2 (with mlx-lm 0.31.1,
+numpy 2.4.2, uvicorn 0.35.0). An unpinned install on 2026-07-19 pulled
+mlx 0.32.0 / mlx-audio 0.4.5, and every request failed with
+`RuntimeError: There is no Stream(cpu, 2) in current thread` — pin to
+the known-good set on any new machine until a newer combo is verified.
+
 ## Auth
 
 Optional bearer token. With no key file at
